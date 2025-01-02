@@ -315,10 +315,11 @@ $functions"""
                 "Missing dependecies for DockerCommandLineCodeExecutor. Please ensure the autogen-ext package was installed with the 'docker' extra."
             ) from e
 
-        client = docker.from_env()
         try:
-            container = await asyncio.to_thread(client.containers.get, self.container_name)
-            await asyncio.to_thread(container.stop)
+            if self._stop_container:
+                client = docker.from_env()
+                container = await asyncio.to_thread(client.containers.get, self.container_name)
+                await asyncio.to_thread(container.stop)
         except NotFound:
             pass
         finally:
@@ -354,6 +355,19 @@ $functions"""
             # Let the docker exception escape if this fails.
             await asyncio.to_thread(client.images.pull, self._image)
 
+        # check if the container already exists
+        try:
+            container = await asyncio.to_thread(
+                client.containers.get, 
+                self.container_name
+            )
+            if container.status == "running":
+                self._container = container
+                self._running = True
+                return
+        except docker.errors.NotFound:
+            pass
+
         self._container = await asyncio.to_thread(
             client.containers.create,
             self._image,
@@ -371,7 +385,7 @@ $functions"""
 
         async def cleanup() -> None:
             await self.stop()
-            asyncio_atexit.unregister(cleanup)  # type: ignore
+            # asyncio_atexit.unregister(cleanup)  # type: ignore
 
         if self._stop_container:
             asyncio_atexit.register(cleanup)  # type: ignore
