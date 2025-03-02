@@ -209,7 +209,7 @@ def assistant_message_to_oai(
 ) -> ChatCompletionAssistantMessageParam:
     assert_valid_name(message.source)
     if isinstance(message.content, list):
-        if message.thought is not None:
+        if hasattr(message, 'thought') and message.thought is not None:
             return ChatCompletionAssistantMessageParam(
                 content=message.thought,
                 tool_calls=[func_call_to_oai(x) for x in message.content],
