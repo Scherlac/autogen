@@ -3,6 +3,7 @@ from typing import List
 
 from .. import AgentId, AgentRuntime, BaseAgent, CancellationToken, FunctionCall
 from ..models import (
+    UserMessage,
     AssistantMessage,
     ChatCompletionClient,
     FunctionExecutionResult,
@@ -21,6 +22,7 @@ async def tool_agent_caller_loop(
     tool_schema: List[ToolSchema] | List[Tool],
     cancellation_token: CancellationToken | None = None,
     caller_source: str = "assistant",
+    retry_count: int = 5,
 ) -> List[LLMMessage]:
     """Start a caller loop for a tool agent. This function sends messages to the tool agent
     and the model client in an alternating fashion until the model client stops generating tool calls.
@@ -68,11 +70,28 @@ async def tool_agent_caller_loop(
             elif isinstance(result, BaseException):
                 raise result  # Unexpected exception.
         generated_messages.append(FunctionExecutionResultMessage(content=function_results))
+
+        retry_count -= 1
+
+        if retry_count == 0:
+            response = await model_client.create(
+                input_messages + 
+                generated_messages +
+                [UserMessage(content="USER MESSAGE\nRetry limit reached. No tool call allowed. Please summarize the results.", source=caller_source)],
+                tools=tool_schema, cancellation_token=cancellation_token
+            )
+            generated_messages.append(AssistantMessage(content=response.content, source=caller_source))
+            break
+        
         # Query the model again with the new response.
         response = await model_client.create(
-            input_messages + generated_messages, tools=tool_schema, cancellation_token=cancellation_token
+            input_messages + 
+            generated_messages +
+            [UserMessage(content=f"USER MESSAGE\nRemaining retry count: {retry_count}\nRefine the function call or finish and summarize the results?", source=caller_source)],
+            tools=tool_schema, cancellation_token=cancellation_token
         )
         generated_messages.append(AssistantMessage(content=response.content, source=caller_source))
+
 
     # Return the generated messages.
     return generated_messages
