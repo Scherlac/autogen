@@ -10,7 +10,6 @@ from autogen_core.models import ChatCompletionClient
 
 from autogen_ext.agents.file_surfer import FileSurfer
 from autogen_ext.agents.magentic_one import MagenticOneCoderAgent
-from autogen_ext.agents.web_surfer import MultimodalWebSurfer
 from autogen_ext.code_executors.local import LocalCommandLineCodeExecutor
 from autogen_ext.models.openai._openai_client import BaseOpenAIChatCompletionClient
 
@@ -127,6 +126,7 @@ class MagenticOne(MagenticOneGroupChat):
         client: ChatCompletionClient,
         hil_mode: bool = False,
         input_func: InputFuncType | None = None,
+        custom_agents: List[ChatAgent] = [],
         code_executor: CodeExecutor | None = None,
     ):
         self.client = client
@@ -141,11 +141,11 @@ class MagenticOne(MagenticOneGroupChat):
             code_executor = LocalCommandLineCodeExecutor()
 
         fs = FileSurfer("FileSurfer", model_client=client)
-        ws = MultimodalWebSurfer("WebSurfer", model_client=client)
+        # ws = MultimodalWebSurfer("WebSurfer", model_client=client)
         coder = MagenticOneCoderAgent("Coder", model_client=client)
         executor = CodeExecutorAgent("ComputerTerminal", code_executor=code_executor)
 
-        agents: List[ChatAgent] = [fs, ws, coder, executor]
+        agents: List[ChatAgent] = [fs, coder, executor] + custom
         if hil_mode:
             user_proxy = UserProxyAgent("User", input_func=input_func)
             agents.append(user_proxy)

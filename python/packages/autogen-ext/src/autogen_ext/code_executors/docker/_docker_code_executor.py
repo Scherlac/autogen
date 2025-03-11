@@ -368,7 +368,7 @@ $functions"""
             from docker.errors import DockerException, ImageNotFound
         except ImportError as e:
             raise RuntimeError(
-                "Missing dependecies for DockerCommandLineCodeExecutor. Please ensure the autogen-ext package was installed with the 'docker' extra."
+                "Missing dependencies for DockerCommandLineCodeExecutor. Please ensure the autogen-ext package was installed with the 'docker' extra."
             ) from e
 
         # Start a container from the image, read to exec commands later

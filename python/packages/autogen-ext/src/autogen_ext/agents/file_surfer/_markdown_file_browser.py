@@ -61,6 +61,14 @@ class MarkdownFileBrowser:
                 path = os.path.abspath(os.path.join(self.path, path))
             # If neither a file or a directory, take it verbatim
 
+        if os.getenv("AGEN_FILE_SURFER_ROOT") is not None:
+            import pathlib
+            p = pathlib.Path(path).resolve()
+            if not p.is_relative_to(os.getenv("AGEN_FILE_SURFER_ROOT")):
+                # change to relative path
+                path = os.path.join(os.getenv("AGEN_FILE_SURFER_ROOT"), path)
+
+
         self.history.append((path, time.time()))
         self._open_path(path)
         self.viewport_current_page = 0
