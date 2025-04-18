@@ -4,7 +4,10 @@ from typing import Awaitable, Callable, List, Optional, Union
 from autogen_agentchat.agents import CodeExecutorAgent, UserProxyAgent
 from autogen_agentchat.base import ChatAgent
 from autogen_agentchat.teams import MagenticOneGroupChat
-from autogen_core import CancellationToken
+from autogen_core import (
+    CancellationToken,
+    AgentRuntime,
+)
 from autogen_core.code_executor import CodeExecutor
 from autogen_core.models import ChatCompletionClient
 
@@ -128,6 +131,7 @@ class MagenticOne(MagenticOneGroupChat):
         input_func: InputFuncType | None = None,
         custom_agents: List[ChatAgent] = [],
         code_executor: CodeExecutor | None = None,
+        runtime: AgentRuntime | None = None,
     ):
         self.client = client
         self._validate_client_capabilities(client)
@@ -145,11 +149,15 @@ class MagenticOne(MagenticOneGroupChat):
         coder = MagenticOneCoderAgent("Coder", model_client=client)
         executor = CodeExecutorAgent("ComputerTerminal", code_executor=code_executor)
 
-        agents: List[ChatAgent] = [fs, coder, executor] + custom
+        agents: List[ChatAgent] = [fs, coder, executor] + custom_agents
         if hil_mode:
             user_proxy = UserProxyAgent("User", input_func=input_func)
             agents.append(user_proxy)
-        super().__init__(agents, model_client=client)
+        super().__init__(
+            agents, 
+            model_client=client,
+            runtime=runtime,
+            )
 
     def _validate_client_capabilities(self, client: ChatCompletionClient) -> None:
         capabilities = client.model_info
@@ -166,3 +174,4 @@ class MagenticOne(MagenticOneGroupChat):
                 "MagenticOne performs best with OpenAI GPT-4o model either " "through OpenAI or Azure OpenAI.",
                 stacklevel=2,
             )
+

@@ -45,6 +45,7 @@ class BaseGroupChat(Team, ABC, ComponentBase[BaseModel]):
         group_chat_manager_class: type[SequentialRoutedAgent],
         termination_condition: TerminationCondition | None = None,
         max_turns: int | None = None,
+        runtime: AgentRuntime | None = None,
     ):
         if len(participants) == 0:
             raise ValueError("At least one participant is required.")
@@ -71,7 +72,9 @@ class BaseGroupChat(Team, ABC, ComponentBase[BaseModel]):
         # Create a runtime for the team.
         # TODO: The runtime should be created by a managed context.
         # Background exceptions must not be ignored as it results in non-surfaced exceptions and early team termination.
-        self._runtime = SingleThreadedAgentRuntime(ignore_unhandled_exceptions=False)
+#        self._runtime = SingleThreadedAgentRuntime(ignore_unhandled_exceptions=False)
+        self._runtime = runtime or SingleThreadedAgentRuntime(
+            ignore_unhandled_exceptions=False)
 
         # Flag to track if the group chat has been initialized.
         self._initialized = False
@@ -380,21 +383,7 @@ class BaseGroupChat(Team, ABC, ComponentBase[BaseModel]):
         """
 
         # Create the messages list if the task is a string or a chat message.
-        messages: List[ChatMessage] | None = None
-        if task is None:
-            pass
-        elif isinstance(task, str):
-            messages = [TextMessage(content=task, source="user")]
-        elif isinstance(task, BaseChatMessage):
-            messages = [task]
-        else:
-            if not task:
-                raise ValueError("Task list cannot be empty.")
-            messages = []
-            for msg in task:
-                if not isinstance(msg, BaseChatMessage):
-                    raise ValueError("All messages in task list must be valid ChatMessage types")
-                messages.append(msg)
+        messages = self.process_task(task)
 
         if self._is_running:
             raise ValueError("The team is already running, it cannot run again until it is stopped.")
@@ -427,7 +416,7 @@ class BaseGroupChat(Team, ABC, ComponentBase[BaseModel]):
             )
             # Collect the output messages in order.
             output_messages: List[AgentEvent | ChatMessage] = []
-            # Yield the messsages until the queue is empty.
+            # Yield the messages until the queue is empty.
             while True:
                 message_future = asyncio.ensure_future(self._output_message_queue.get())
                 if cancellation_token is not None:
@@ -458,6 +447,52 @@ class BaseGroupChat(Team, ABC, ComponentBase[BaseModel]):
 
                 # Indicate that the team is no longer running.
                 self._is_running = False
+
+    async def send_message(
+        self,
+        message: Any,
+        recipient: AgentId | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Any:
+        """See :py:meth:`autogen_core.AgentRuntime.send_message` for more information."""
+
+        if not self._initialized:
+            await self._init(self._runtime)
+
+        if cancellation_token is None:
+            cancellation_token = CancellationToken()
+
+        if recipient is None:
+            recipient = self.get_recipient()
+
+        return await self._runtime.send_message(
+            message,
+            recipient=recipient,
+            cancellation_token=cancellation_token,
+        )
+
+    def get_recipient(self):
+        return AgentId(type=self._group_chat_manager_topic_type, key=self._team_id)
+
+
+    def process_task(self, task):
+        messages: List[ChatMessage] | None = None
+        if task is None:
+            pass
+        elif isinstance(task, str):
+            messages = [TextMessage(content=task, source="user")]
+        elif isinstance(task, BaseChatMessage):
+            messages = [task]
+        else:
+            if not task:
+                raise ValueError("Task list cannot be empty.")
+            messages = []
+            for msg in task:
+                if not isinstance(msg, BaseChatMessage):
+                    raise ValueError("All messages in task list must be valid ChatMessage types")
+                messages.append(msg)
+
+        return messages
 
     async def reset(self) -> None:
         """Reset the team and its participants to their initial state.

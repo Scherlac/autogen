@@ -9,6 +9,11 @@ from ._group_chat._magentic_one import MagenticOneGroupChat
 from ._group_chat._round_robin_group_chat import RoundRobinGroupChat
 from ._group_chat._selector_group_chat import SelectorGroupChat, SelectorGroupChatManager
 from ._group_chat._swarm_group_chat import Swarm
+from ._group_chat._events import (
+    GroupChatStart,
+    GroupChatMessage,
+    GroupChatTermination
+)
 
 __all__ = [
     "BaseGroupChat",
@@ -18,4 +23,7 @@ __all__ = [
     "SelectorGroupChatManager",
     "Swarm",
     "MagenticOneGroupChat",
+    "GroupChatStart",
+    "GroupChatMessage",
+    "GroupChatTermination",
 ]
