@@ -27,7 +27,7 @@ interface RunViewProps {
   onCancel?: () => void;
   isFirstRun?: boolean;
   streamingContent?: {
-    runId: string;
+    runId: number;
     content: string;
     source: string;
   } | null;
@@ -113,6 +113,8 @@ const RunView: React.FC<RunViewProps> = ({
     return run.messages.filter((msg) => msg.config.source !== "llm_call_event");
   }, [run.messages, uiSettings.show_llm_call_events]);
 
+  console.log("Run task", run.task);
+
   // Replace existing scroll effect with this simpler one
   useEffect(() => {
     setTimeout(() => {
@@ -189,7 +191,7 @@ const RunView: React.FC<RunViewProps> = ({
     }
   };
 
-  const lastResultMessage = run.team_result?.task_result.messages.slice(-1)[0];
+  const lastResultMessage = run.team_result?.task_result?.messages.slice(-1)[0];
   const lastMessage = getLastMeaningfulMessage(visibleMessages);
 
   return (
@@ -211,8 +213,7 @@ const RunView: React.FC<RunViewProps> = ({
             }
           >
             <span className="cursor-help">
-              Run ...{run.id.slice(-6)} |{" "}
-              {getRelativeTimeString(run?.created_at || "")}{" "}
+              Run ...{run.id} | {getRelativeTimeString(run?.created_at || "")}{" "}
             </span>
           </Tooltip>
           {!isFirstRun && (

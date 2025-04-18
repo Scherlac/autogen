@@ -1,18 +1,18 @@
-import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, List
+from typing import Dict, List
 
 import pytest
 from autogen_agentchat import EVENT_LOGGER_NAME
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import Handoff, TaskResult
 from autogen_agentchat.messages import (
-    ChatMessage,
+    BaseChatMessage,
     HandoffMessage,
     MemoryQueryEvent,
     ModelClientStreamingChunkEvent,
     MultiModalMessage,
+    StructuredMessage,
     TextMessage,
     ThoughtEvent,
     ToolCallExecutionEvent,
@@ -26,45 +26,22 @@ from autogen_core.models import (
     AssistantMessage,
     CreateResult,
     FunctionExecutionResult,
+    FunctionExecutionResultMessage,
     LLMMessage,
     RequestUsage,
     SystemMessage,
     UserMessage,
 )
 from autogen_core.models._model_client import ModelFamily
-from autogen_core.tools import FunctionTool
+from autogen_core.tools import BaseTool, FunctionTool
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
-from openai.resources.chat.completions import AsyncCompletions
-from openai.types.chat.chat_completion import ChatCompletion, Choice
-from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
-from openai.types.chat.chat_completion_message_tool_call import (
-    ChatCompletionMessageToolCall,
-    Function,
-)
-from openai.types.completion_usage import CompletionUsage
+from pydantic import BaseModel, ValidationError
 from utils import FileLogHandler
 
 logger = logging.getLogger(EVENT_LOGGER_NAME)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(FileLogHandler("test_assistant_agent.log"))
-
-
-class _MockChatCompletion:
-    def __init__(self, chat_completions: List[ChatCompletion]) -> None:
-        self._saved_chat_completions = chat_completions
-        self.curr_index = 0
-        self.calls: List[List[LLMMessage]] = []
-
-    async def mock_create(
-        self, *args: Any, **kwargs: Any
-    ) -> ChatCompletion | AsyncGenerator[ChatCompletionChunk, None]:
-        self.calls.append(kwargs["messages"])  # Save the call
-        await asyncio.sleep(0.1)
-        completion = self._saved_chat_completions[self.curr_index]
-        self.curr_index += 1
-        return completion
 
 
 def _pass_function(input: str) -> str:
@@ -81,69 +58,29 @@ async def _echo_function(input: str) -> str:
 
 @pytest.mark.asyncio
 async def test_run_with_tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="tool_calls",
-                    index=0,
-                    message=ChatCompletionMessage(
-                        content="Calling pass function",
-                        tool_calls=[
-                            ChatCompletionMessageToolCall(
-                                id="1",
-                                type="function",
-                                function=Function(
-                                    name="_pass_function",
-                                    arguments=json.dumps({"input": "task"}),
-                                ),
-                            )
-                        ],
-                        role="assistant",
-                    ),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="pass", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="TERMINATE", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[FunctionCall(id="1", arguments=json.dumps({"input": "task"}), name="_pass_function")],
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                thought="Calling pass function",
+                cached=False,
+            ),
+            "pass",
+            "TERMINATE",
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
     agent = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[
             _pass_function,
             _fail_function,
@@ -151,6 +88,15 @@ async def test_run_with_tools(monkeypatch: pytest.MonkeyPatch) -> None:
         ],
     )
     result = await agent.run(task="task")
+
+    # Make sure the create call was made with the correct parameters.
+    assert len(model_client.create_calls) == 1
+    llm_messages = model_client.create_calls[0]["messages"]
+    assert len(llm_messages) == 2
+    assert isinstance(llm_messages[0], SystemMessage)
+    assert llm_messages[0].content == agent._system_messages[0].content  # type: ignore
+    assert isinstance(llm_messages[1], UserMessage)
+    assert llm_messages[1].content == "task"
 
     assert len(result.messages) == 5
     assert isinstance(result.messages[0], TextMessage)
@@ -168,7 +114,7 @@ async def test_run_with_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.messages[4].models_usage is None
 
     # Test streaming.
-    mock.curr_index = 0  # Reset the mock
+    model_client.reset()
     index = 0
     async for message in agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
@@ -181,7 +127,7 @@ async def test_run_with_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     state = await agent.save_state()
     agent2 = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[_pass_function, _fail_function, FunctionTool(_echo_function, description="Echo")],
     )
     await agent2.load_state(state)
@@ -190,68 +136,60 @@ async def test_run_with_tools(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_with_tools_and_reflection(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="tool_calls",
-                    index=0,
-                    message=ChatCompletionMessage(
-                        content=None,
-                        tool_calls=[
-                            ChatCompletionMessageToolCall(
-                                id="1",
-                                type="function",
-                                function=Function(
-                                    name="_pass_function",
-                                    arguments=json.dumps({"input": "task"}),
-                                ),
-                            )
-                        ],
-                        role="assistant",
-                    ),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(finish_reason="stop", index=0, message=ChatCompletionMessage(content="Hello", role="assistant"))
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop", index=0, message=ChatCompletionMessage(content="TERMINATE", role="assistant")
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+async def test_run_with_tools_and_reflection() -> None:
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[FunctionCall(id="1", arguments=json.dumps({"input": "task"}), name="_pass_function")],
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+            CreateResult(
+                finish_reason="stop",
+                content="Hello",
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+            CreateResult(
+                finish_reason="stop",
+                content="TERMINATE",
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
     agent = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[_pass_function, _fail_function, FunctionTool(_echo_function, description="Echo")],
         reflect_on_tool_use=True,
     )
     result = await agent.run(task="task")
+
+    # Make sure the create call was made with the correct parameters.
+    assert len(model_client.create_calls) == 2
+    llm_messages = model_client.create_calls[0]["messages"]
+    assert len(llm_messages) == 2
+    assert isinstance(llm_messages[0], SystemMessage)
+    assert llm_messages[0].content == agent._system_messages[0].content  # type: ignore
+    assert isinstance(llm_messages[1], UserMessage)
+    assert llm_messages[1].content == "task"
+    llm_messages = model_client.create_calls[1]["messages"]
+    assert len(llm_messages) == 4
+    assert isinstance(llm_messages[0], SystemMessage)
+    assert llm_messages[0].content == agent._system_messages[0].content  # type: ignore
+    assert isinstance(llm_messages[1], UserMessage)
+    assert llm_messages[1].content == "task"
+    assert isinstance(llm_messages[2], AssistantMessage)
+    assert isinstance(llm_messages[3], FunctionExecutionResultMessage)
 
     assert len(result.messages) == 4
     assert isinstance(result.messages[0], TextMessage)
@@ -269,7 +207,7 @@ async def test_run_with_tools_and_reflection(monkeypatch: pytest.MonkeyPatch) ->
     assert result.messages[3].models_usage.prompt_tokens == 10
 
     # Test streaming.
-    mock.curr_index = 0  # pyright: ignore
+    model_client.reset()
     index = 0
     async for message in agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
@@ -282,7 +220,7 @@ async def test_run_with_tools_and_reflection(monkeypatch: pytest.MonkeyPatch) ->
     state = await agent.save_state()
     agent2 = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[
             _pass_function,
             _fail_function,
@@ -295,86 +233,34 @@ async def test_run_with_tools_and_reflection(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_run_with_parallel_tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="tool_calls",
-                    index=0,
-                    message=ChatCompletionMessage(
-                        content="Calling pass and echo functions",
-                        tool_calls=[
-                            ChatCompletionMessageToolCall(
-                                id="1",
-                                type="function",
-                                function=Function(
-                                    name="_pass_function",
-                                    arguments=json.dumps({"input": "task1"}),
-                                ),
-                            ),
-                            ChatCompletionMessageToolCall(
-                                id="2",
-                                type="function",
-                                function=Function(
-                                    name="_pass_function",
-                                    arguments=json.dumps({"input": "task2"}),
-                                ),
-                            ),
-                            ChatCompletionMessageToolCall(
-                                id="3",
-                                type="function",
-                                function=Function(
-                                    name="_echo_function",
-                                    arguments=json.dumps({"input": "task3"}),
-                                ),
-                            ),
-                        ],
-                        role="assistant",
-                    ),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="pass", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="TERMINATE", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+async def test_run_with_parallel_tools() -> None:
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[
+                    FunctionCall(id="1", arguments=json.dumps({"input": "task1"}), name="_pass_function"),
+                    FunctionCall(id="2", arguments=json.dumps({"input": "task2"}), name="_pass_function"),
+                    FunctionCall(id="3", arguments=json.dumps({"input": "task3"}), name="_echo_function"),
+                ],
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                thought="Calling pass and echo functions",
+                cached=False,
+            ),
+            "pass",
+            "TERMINATE",
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
     agent = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[
             _pass_function,
             _fail_function,
@@ -399,9 +285,9 @@ async def test_run_with_parallel_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.messages[2].models_usage.prompt_tokens == 10
     assert isinstance(result.messages[3], ToolCallExecutionEvent)
     expected_content = [
-        FunctionExecutionResult(call_id="1", content="pass", is_error=False),
-        FunctionExecutionResult(call_id="2", content="pass", is_error=False),
-        FunctionExecutionResult(call_id="3", content="task3", is_error=False),
+        FunctionExecutionResult(call_id="1", content="pass", is_error=False, name="_pass_function"),
+        FunctionExecutionResult(call_id="2", content="pass", is_error=False, name="_pass_function"),
+        FunctionExecutionResult(call_id="3", content="task3", is_error=False, name="_echo_function"),
     ]
     for expected in expected_content:
         assert expected in result.messages[3].content
@@ -411,7 +297,7 @@ async def test_run_with_parallel_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.messages[4].models_usage is None
 
     # Test streaming.
-    mock.curr_index = 0  # Reset the mock
+    model_client.reset()
     index = 0
     async for message in agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
@@ -424,7 +310,7 @@ async def test_run_with_parallel_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     state = await agent.save_state()
     agent2 = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[_pass_function, _fail_function, FunctionTool(_echo_function, description="Echo")],
     )
     await agent2.load_state(state)
@@ -433,86 +319,33 @@ async def test_run_with_parallel_tools(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_with_parallel_tools_with_empty_call_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="tool_calls",
-                    index=0,
-                    message=ChatCompletionMessage(
-                        content=None,
-                        tool_calls=[
-                            ChatCompletionMessageToolCall(
-                                id="",
-                                type="function",
-                                function=Function(
-                                    name="_pass_function",
-                                    arguments=json.dumps({"input": "task1"}),
-                                ),
-                            ),
-                            ChatCompletionMessageToolCall(
-                                id="",
-                                type="function",
-                                function=Function(
-                                    name="_pass_function",
-                                    arguments=json.dumps({"input": "task2"}),
-                                ),
-                            ),
-                            ChatCompletionMessageToolCall(
-                                id="",
-                                type="function",
-                                function=Function(
-                                    name="_echo_function",
-                                    arguments=json.dumps({"input": "task3"}),
-                                ),
-                            ),
-                        ],
-                        role="assistant",
-                    ),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="pass", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="TERMINATE", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+async def test_run_with_parallel_tools_with_empty_call_ids() -> None:
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[
+                    FunctionCall(id="", arguments=json.dumps({"input": "task1"}), name="_pass_function"),
+                    FunctionCall(id="", arguments=json.dumps({"input": "task2"}), name="_pass_function"),
+                    FunctionCall(id="", arguments=json.dumps({"input": "task3"}), name="_echo_function"),
+                ],
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+            "pass",
+            "TERMINATE",
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
     agent = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[
             _pass_function,
             _fail_function,
@@ -535,9 +368,9 @@ async def test_run_with_parallel_tools_with_empty_call_ids(monkeypatch: pytest.M
     assert result.messages[1].models_usage.prompt_tokens == 10
     assert isinstance(result.messages[2], ToolCallExecutionEvent)
     expected_content = [
-        FunctionExecutionResult(call_id="", content="pass", is_error=False),
-        FunctionExecutionResult(call_id="", content="pass", is_error=False),
-        FunctionExecutionResult(call_id="", content="task3", is_error=False),
+        FunctionExecutionResult(call_id="", content="pass", is_error=False, name="_pass_function"),
+        FunctionExecutionResult(call_id="", content="pass", is_error=False, name="_pass_function"),
+        FunctionExecutionResult(call_id="", content="task3", is_error=False, name="_echo_function"),
     ]
     for expected in expected_content:
         assert expected in result.messages[2].content
@@ -547,7 +380,7 @@ async def test_run_with_parallel_tools_with_empty_call_ids(monkeypatch: pytest.M
     assert result.messages[3].models_usage is None
 
     # Test streaming.
-    mock.curr_index = 0  # Reset the mock
+    model_client.reset()
     index = 0
     async for message in agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
@@ -560,7 +393,7 @@ async def test_run_with_parallel_tools_with_empty_call_ids(monkeypatch: pytest.M
     state = await agent.save_state()
     agent2 = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         tools=[_pass_function, _fail_function, FunctionTool(_echo_function, description="Echo")],
     )
     await agent2.load_state(state)
@@ -569,43 +402,322 @@ async def test_run_with_parallel_tools_with_empty_call_ids(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_handoffs(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_output_format() -> None:
+    class AgentResponse(BaseModel):
+        response: str
+        status: str
+
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="stop",
+                content=AgentResponse(response="Hello", status="success").model_dump_json(),
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+        ]
+    )
+    agent = AssistantAgent(
+        "test_agent",
+        model_client=model_client,
+        output_content_type=AgentResponse,
+    )
+    assert StructuredMessage[AgentResponse] in agent.produced_message_types
+    assert TextMessage not in agent.produced_message_types
+
+    result = await agent.run()
+    assert len(result.messages) == 1
+    assert isinstance(result.messages[0], StructuredMessage)
+    assert isinstance(result.messages[0].content, AgentResponse)  # type: ignore[reportUnknownMemberType]
+    assert result.messages[0].content.response == "Hello"
+    assert result.messages[0].content.status == "success"
+
+    # Test streaming.
+    agent = AssistantAgent(
+        "test_agent",
+        model_client=model_client,
+        model_client_stream=True,
+        output_content_type=AgentResponse,
+    )
+    model_client.reset()
+    stream = agent.run_stream()
+    stream_result: TaskResult | None = None
+    async for message in stream:
+        if isinstance(message, TaskResult):
+            stream_result = message
+    assert stream_result is not None
+    assert len(stream_result.messages) == 1
+    assert isinstance(stream_result.messages[0], StructuredMessage)
+    assert isinstance(stream_result.messages[0].content, AgentResponse)  # type: ignore[reportUnknownMemberType]
+    assert stream_result.messages[0].content.response == "Hello"
+    assert stream_result.messages[0].content.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_reflection_output_format() -> None:
+    class AgentResponse(BaseModel):
+        response: str
+        status: str
+
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[FunctionCall(id="1", arguments=json.dumps({"input": "task"}), name="_pass_function")],
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+            AgentResponse(response="Hello", status="success").model_dump_json(),
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
+    agent = AssistantAgent(
+        "test_agent",
+        model_client=model_client,
+        output_content_type=AgentResponse,
+        # reflect_on_tool_use=True,
+        tools=[
+            _pass_function,
+            _fail_function,
+        ],
+    )
+    result = await agent.run()
+    assert len(result.messages) == 3
+    assert isinstance(result.messages[0], ToolCallRequestEvent)
+    assert isinstance(result.messages[1], ToolCallExecutionEvent)
+    assert isinstance(result.messages[2], StructuredMessage)
+    assert isinstance(result.messages[2].content, AgentResponse)  # type: ignore[reportUnknownMemberType]
+    assert result.messages[2].content.response == "Hello"
+    assert result.messages[2].content.status == "success"
+
+    # Test streaming.
+    agent = AssistantAgent(
+        "test_agent",
+        model_client=model_client,
+        model_client_stream=True,
+        output_content_type=AgentResponse,
+        # reflect_on_tool_use=True,
+        tools=[
+            _pass_function,
+            _fail_function,
+        ],
+    )
+    model_client.reset()
+    stream = agent.run_stream()
+    stream_result: TaskResult | None = None
+    async for message in stream:
+        if isinstance(message, TaskResult):
+            stream_result = message
+    assert stream_result is not None
+    assert len(stream_result.messages) == 3
+    assert isinstance(stream_result.messages[0], ToolCallRequestEvent)
+    assert isinstance(stream_result.messages[1], ToolCallExecutionEvent)
+    assert isinstance(stream_result.messages[2], StructuredMessage)
+    assert isinstance(stream_result.messages[2].content, AgentResponse)  # type: ignore[reportUnknownMemberType]
+    assert stream_result.messages[2].content.response == "Hello"
+    assert stream_result.messages[2].content.status == "success"
+
+    # Test when reflect_on_tool_use is False
+    model_client.reset()
+    agent = AssistantAgent(
+        "test_agent",
+        model_client=model_client,
+        output_content_type=AgentResponse,
+        reflect_on_tool_use=False,
+        tools=[
+            _pass_function,
+            _fail_function,
+        ],
+    )
+    result = await agent.run()
+    assert len(result.messages) == 3
+    assert isinstance(result.messages[0], ToolCallRequestEvent)
+    assert isinstance(result.messages[1], ToolCallExecutionEvent)
+    assert isinstance(result.messages[2], ToolCallSummaryMessage)
+
+
+@pytest.mark.asyncio
+async def test_handoffs() -> None:
     handoff = Handoff(target="agent2")
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="tool_calls",
-                    index=0,
-                    message=ChatCompletionMessage(
-                        content=None,
-                        tool_calls=[
-                            ChatCompletionMessageToolCall(
-                                id="1",
-                                type="function",
-                                function=Function(
-                                    name=handoff.name,
-                                    arguments=json.dumps({}),
-                                ),
-                            )
-                        ],
-                        role="assistant",
-                    ),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=42, completion_tokens=43, total_tokens=85),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[
+                    FunctionCall(id="1", arguments=json.dumps({}), name=handoff.name),
+                ],
+                usage=RequestUsage(prompt_tokens=42, completion_tokens=43),
+                cached=False,
+                thought="Calling handoff function",
+            )
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
     tool_use_agent = AssistantAgent(
         "tool_use_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
+        tools=[
+            _pass_function,
+            _fail_function,
+            FunctionTool(_echo_function, description="Echo"),
+        ],
+        handoffs=[handoff],
+    )
+    assert HandoffMessage in tool_use_agent.produced_message_types
+    result = await tool_use_agent.run(task="task")
+    assert len(result.messages) == 5
+    assert isinstance(result.messages[0], TextMessage)
+    assert result.messages[0].models_usage is None
+    assert isinstance(result.messages[1], ThoughtEvent)
+    assert result.messages[1].content == "Calling handoff function"
+    assert isinstance(result.messages[2], ToolCallRequestEvent)
+    assert result.messages[2].models_usage is not None
+    assert result.messages[2].models_usage.completion_tokens == 43
+    assert result.messages[2].models_usage.prompt_tokens == 42
+    assert isinstance(result.messages[3], ToolCallExecutionEvent)
+    assert result.messages[3].models_usage is None
+    assert isinstance(result.messages[4], HandoffMessage)
+    assert result.messages[4].content == handoff.message
+    assert result.messages[4].target == handoff.target
+    assert result.messages[4].models_usage is None
+    assert result.messages[4].context == [AssistantMessage(content="Calling handoff function", source="tool_use_agent")]
+
+    # Test streaming.
+    model_client.reset()
+    index = 0
+    async for message in tool_use_agent.run_stream(task="task"):
+        if isinstance(message, TaskResult):
+            assert message == result
+        else:
+            assert message == result.messages[index]
+        index += 1
+
+
+@pytest.mark.asyncio
+async def test_handoff_with_tool_call_context() -> None:
+    handoff = Handoff(target="agent2")
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[
+                    FunctionCall(id="1", arguments=json.dumps({}), name=handoff.name),
+                    FunctionCall(id="2", arguments=json.dumps({"input": "task"}), name="_pass_function"),
+                ],
+                usage=RequestUsage(prompt_tokens=42, completion_tokens=43),
+                cached=False,
+                thought="Calling handoff function",
+            )
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
+    tool_use_agent = AssistantAgent(
+        "tool_use_agent",
+        model_client=model_client,
+        tools=[
+            _pass_function,
+            _fail_function,
+            FunctionTool(_echo_function, description="Echo"),
+        ],
+        handoffs=[handoff],
+    )
+    assert HandoffMessage in tool_use_agent.produced_message_types
+    result = await tool_use_agent.run(task="task")
+    assert len(result.messages) == 5
+    assert isinstance(result.messages[0], TextMessage)
+    assert result.messages[0].models_usage is None
+    assert isinstance(result.messages[1], ThoughtEvent)
+    assert result.messages[1].content == "Calling handoff function"
+    assert isinstance(result.messages[2], ToolCallRequestEvent)
+    assert result.messages[2].models_usage is not None
+    assert result.messages[2].models_usage.completion_tokens == 43
+    assert result.messages[2].models_usage.prompt_tokens == 42
+    assert isinstance(result.messages[3], ToolCallExecutionEvent)
+    assert result.messages[3].models_usage is None
+    assert isinstance(result.messages[4], HandoffMessage)
+    assert result.messages[4].content == handoff.message
+    assert result.messages[4].target == handoff.target
+    assert result.messages[4].models_usage is None
+    assert result.messages[4].context == [
+        AssistantMessage(
+            content=[FunctionCall(id="2", arguments=r'{"input": "task"}', name="_pass_function")],
+            source="tool_use_agent",
+            thought="Calling handoff function",
+        ),
+        FunctionExecutionResultMessage(
+            content=[FunctionExecutionResult(call_id="2", content="pass", is_error=False, name="_pass_function")]
+        ),
+    ]
+
+    # Test streaming.
+    model_client.reset()
+    index = 0
+    async for message in tool_use_agent.run_stream(task="task"):
+        if isinstance(message, TaskResult):
+            assert message == result
+        else:
+            assert message == result.messages[index]
+        index += 1
+
+
+@pytest.mark.asyncio
+async def test_custom_handoffs() -> None:
+    name = "transfer_to_agent2"
+    description = "Handoff to agent2."
+    next_action = "next_action"
+
+    class TextCommandHandOff(Handoff):
+        @property
+        def handoff_tool(self) -> BaseTool[BaseModel, BaseModel]:
+            """Create a handoff tool from this handoff configuration."""
+
+            def _next_action(action: str) -> str:
+                """Returns the action you want the user to perform"""
+                return action
+
+            return FunctionTool(_next_action, name=self.name, description=self.description, strict=True)
+
+    handoff = TextCommandHandOff(name=name, description=description, target="agent2")
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[
+                    FunctionCall(id="1", arguments=json.dumps({"action": next_action}), name=handoff.name),
+                ],
+                usage=RequestUsage(prompt_tokens=42, completion_tokens=43),
+                cached=False,
+            )
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
+    tool_use_agent = AssistantAgent(
+        "tool_use_agent",
+        model_client=model_client,
         tools=[
             _pass_function,
             _fail_function,
@@ -625,12 +737,90 @@ async def test_handoffs(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(result.messages[2], ToolCallExecutionEvent)
     assert result.messages[2].models_usage is None
     assert isinstance(result.messages[3], HandoffMessage)
-    assert result.messages[3].content == handoff.message
+    assert result.messages[3].content == next_action
     assert result.messages[3].target == handoff.target
+
     assert result.messages[3].models_usage is None
 
     # Test streaming.
-    mock.curr_index = 0  # pyright: ignore
+    model_client.reset()
+    index = 0
+    async for message in tool_use_agent.run_stream(task="task"):
+        if isinstance(message, TaskResult):
+            assert message == result
+        else:
+            assert message == result.messages[index]
+        index += 1
+
+
+@pytest.mark.asyncio
+async def test_custom_object_handoffs() -> None:
+    """test handoff tool return a object"""
+    name = "transfer_to_agent2"
+    description = "Handoff to agent2."
+    next_action = {"action": "next_action"}  # using a map, not a str
+
+    class DictCommandHandOff(Handoff):
+        @property
+        def handoff_tool(self) -> BaseTool[BaseModel, BaseModel]:
+            """Create a handoff tool from this handoff configuration."""
+
+            def _next_action(action: str) -> Dict[str, str]:
+                """Returns the action you want the user to perform"""
+                return {"action": action}
+
+            return FunctionTool(_next_action, name=self.name, description=self.description, strict=True)
+
+    handoff = DictCommandHandOff(name=name, description=description, target="agent2")
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[
+                    FunctionCall(id="1", arguments=json.dumps({"action": "next_action"}), name=handoff.name),
+                ],
+                usage=RequestUsage(prompt_tokens=42, completion_tokens=43),
+                cached=False,
+            )
+        ],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
+    tool_use_agent = AssistantAgent(
+        "tool_use_agent",
+        model_client=model_client,
+        tools=[
+            _pass_function,
+            _fail_function,
+            FunctionTool(_echo_function, description="Echo"),
+        ],
+        handoffs=[handoff],
+    )
+    assert HandoffMessage in tool_use_agent.produced_message_types
+    result = await tool_use_agent.run(task="task")
+    assert len(result.messages) == 4
+    assert isinstance(result.messages[0], TextMessage)
+    assert result.messages[0].models_usage is None
+    assert isinstance(result.messages[1], ToolCallRequestEvent)
+    assert result.messages[1].models_usage is not None
+    assert result.messages[1].models_usage.completion_tokens == 43
+    assert result.messages[1].models_usage.prompt_tokens == 42
+    assert isinstance(result.messages[2], ToolCallExecutionEvent)
+    assert result.messages[2].models_usage is None
+    assert isinstance(result.messages[3], HandoffMessage)
+    # the content will return as a string, because the function call will convert to string
+    assert result.messages[3].content == str(next_action)
+    assert result.messages[3].target == handoff.target
+
+    assert result.messages[3].models_usage is None
+
+    # Test streaming.
+    model_client.reset()
     index = 0
     async for message in tool_use_agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
@@ -642,32 +832,31 @@ async def test_handoffs(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_multi_modal_task(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id2",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="Hello", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+    model_client = ReplayChatCompletionClient(["Hello"])
     agent = AssistantAgent(
         name="assistant",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
     )
     # Generate a random base64 image.
     img_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
     result = await agent.run(task=MultiModalMessage(source="user", content=["Test", Image.from_base64(img_base64)]))
+    assert len(result.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_with_structured_task() -> None:
+    class InputTask(BaseModel):
+        input: str
+        data: List[str]
+
+    model_client = ReplayChatCompletionClient(["Hello"])
+    agent = AssistantAgent(
+        name="assistant",
+        model_client=model_client,
+    )
+
+    task = StructuredMessage[InputTask](content=InputTask(input="Test", data=["Test1", "Test2"]), source="user")
+    result = await agent.run(task=task)
     assert len(result.messages) == 2
 
 
@@ -677,7 +866,13 @@ async def test_invalid_model_capabilities() -> None:
     model_client = OpenAIChatCompletionClient(
         model=model,
         api_key="",
-        model_info={"vision": False, "function_calling": False, "json_output": False, "family": ModelFamily.UNKNOWN},
+        model_info={
+            "vision": False,
+            "function_calling": False,
+            "json_output": False,
+            "family": ModelFamily.UNKNOWN,
+            "structured_output": False,
+        },
     )
 
     with pytest.raises(ValueError):
@@ -698,17 +893,29 @@ async def test_invalid_model_capabilities() -> None:
 
 
 @pytest.mark.asyncio
-async def test_remove_images(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_remove_images() -> None:
     model = "random-model"
     model_client_1 = OpenAIChatCompletionClient(
         model=model,
         api_key="",
-        model_info={"vision": False, "function_calling": False, "json_output": False, "family": ModelFamily.UNKNOWN},
+        model_info={
+            "vision": False,
+            "function_calling": False,
+            "json_output": False,
+            "family": ModelFamily.UNKNOWN,
+            "structured_output": False,
+        },
     )
     model_client_2 = OpenAIChatCompletionClient(
         model=model,
         api_key="",
-        model_info={"vision": True, "function_calling": False, "json_output": False, "family": ModelFamily.UNKNOWN},
+        model_info={
+            "vision": True,
+            "function_calling": False,
+            "json_output": False,
+            "family": ModelFamily.UNKNOWN,
+            "structured_output": False,
+        },
     )
 
     img_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
@@ -732,32 +939,23 @@ async def test_remove_images(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_list_chat_messages(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="Response to message 1", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="stop",
+                content="Response to message 1",
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            )
+        ]
+    )
     agent = AssistantAgent(
         "test_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
     )
 
     # Create a list of chat messages
-    messages: List[ChatMessage] = [
+    messages: List[BaseChatMessage] = [
         TextMessage(content="Message 1", source="user"),
         TextMessage(content="Message 2", source="user"),
     ]
@@ -779,7 +977,7 @@ async def test_list_chat_messages(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.messages[2].models_usage.prompt_tokens == 10
 
     # Test run_stream method with list of messages
-    mock.curr_index = 0  # Reset mock index using public attribute
+    model_client.reset()  # Reset the mock client
     index = 0
     async for message in agent.run_stream(task=messages):
         if isinstance(message, TaskResult):
@@ -791,29 +989,11 @@ async def test_list_chat_messages(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_model_context(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="Response to message 3", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+    model_client = ReplayChatCompletionClient(["Response to message 3"])
     model_context = BufferedChatCompletionContext(buffer_size=2)
     agent = AssistantAgent(
         "test_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         model_context=model_context,
     )
 
@@ -824,34 +1004,18 @@ async def test_model_context(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     await agent.run(task=messages)
 
+    # Check that the model_context property returns the correct internal context
+    assert agent.model_context == model_context
     # Check if the mock client is called with only the last two messages.
-    assert len(mock.calls) == 1
+    assert len(model_client.create_calls) == 1
     # 2 message from the context + 1 system message
-    assert len(mock.calls[0]) == 3
+    assert len(model_client.create_calls[0]["messages"]) == 3
 
 
 @pytest.mark.asyncio
 async def test_run_with_memory(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="Hello", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=0),
-        ),
-    ]
+    model_client = ReplayChatCompletionClient(["Hello"])
     b64_image_str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
 
     # Test basic memory properties and empty context
     memory = ListMemory(name="test_memory")
@@ -883,7 +1047,7 @@ async def test_run_with_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(TypeError):
         AssistantAgent(
             "test_agent",
-            model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+            model_client=model_client,
             memory="invalid",  # type: ignore
         )
 
@@ -891,9 +1055,7 @@ async def test_run_with_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     memory2 = ListMemory()
     await memory2.add(MemoryContent(content="test instruction", mime_type=MemoryMimeType.TEXT))
 
-    agent = AssistantAgent(
-        "test_agent", model_client=OpenAIChatCompletionClient(model=model, api_key=""), memory=[memory2]
-    )
+    agent = AssistantAgent("test_agent", model_client=model_client, memory=[memory2])
 
     # Test dump and load component with memory
     agent_config: ComponentModel = agent.dump_component()
@@ -916,30 +1078,21 @@ async def test_run_with_memory(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_assistant_agent_declarative(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = "gpt-4o-2024-05-13"
-    chat_completions = [
-        ChatCompletion(
-            id="id1",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    index=0,
-                    message=ChatCompletionMessage(content="Response to message 3", role="assistant"),
-                )
-            ],
-            created=0,
-            model=model,
-            object="chat.completion",
-            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-        ),
-    ]
-    mock = _MockChatCompletion(chat_completions)
-    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+async def test_assistant_agent_declarative() -> None:
+    model_client = ReplayChatCompletionClient(
+        ["Response to message 3"],
+        model_info={
+            "function_calling": True,
+            "vision": True,
+            "json_output": True,
+            "family": ModelFamily.GPT_4O,
+            "structured_output": True,
+        },
+    )
     model_context = BufferedChatCompletionContext(buffer_size=2)
     agent = AssistantAgent(
         "test_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         model_context=model_context,
         memory=[ListMemory(name="test_memory")],
     )
@@ -952,7 +1105,7 @@ async def test_assistant_agent_declarative(monkeypatch: pytest.MonkeyPatch) -> N
 
     agent3 = AssistantAgent(
         "test_agent",
-        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        model_client=model_client,
         model_context=model_context,
         tools=[
             _pass_function,
@@ -979,6 +1132,7 @@ async def test_model_client_stream() -> None:
     chunks: List[str] = []
     async for message in agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
+            assert isinstance(message.messages[-1], TextMessage)
             assert message.messages[-1].content == "Response to message 3"
         elif isinstance(message, ModelClientStreamingChunkEvent):
             chunks.append(message.content)
@@ -1012,15 +1166,118 @@ async def test_model_client_stream_with_tool_calls() -> None:
     chunks: List[str] = []
     async for message in agent.run_stream(task="task"):
         if isinstance(message, TaskResult):
+            assert isinstance(message.messages[-1], TextMessage)
+            assert isinstance(message.messages[1], ToolCallRequestEvent)
             assert message.messages[-1].content == "Example response 2 to task"
             assert message.messages[1].content == [
                 FunctionCall(id="1", name="_pass_function", arguments=r'{"input": "task"}'),
                 FunctionCall(id="3", name="_echo_function", arguments=r'{"input": "task"}'),
             ]
+            assert isinstance(message.messages[2], ToolCallExecutionEvent)
             assert message.messages[2].content == [
-                FunctionExecutionResult(call_id="1", content="pass", is_error=False),
-                FunctionExecutionResult(call_id="3", content="task", is_error=False),
+                FunctionExecutionResult(call_id="1", content="pass", is_error=False, name="_pass_function"),
+                FunctionExecutionResult(call_id="3", content="task", is_error=False, name="_echo_function"),
             ]
         elif isinstance(message, ModelClientStreamingChunkEvent):
             chunks.append(message.content)
     assert "".join(chunks) == "Example response 2 to task"
+
+
+@pytest.mark.asyncio
+async def test_invalid_structured_output_format() -> None:
+    class AgentResponse(BaseModel):
+        response: str
+        status: str
+
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="stop",
+                content='{"response": "Hello"}',
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            ),
+        ]
+    )
+
+    agent = AssistantAgent(
+        name="assistant",
+        model_client=model_client,
+        output_content_type=AgentResponse,
+    )
+
+    with pytest.raises(ValidationError):
+        await agent.run()
+
+
+@pytest.mark.asyncio
+async def test_structured_message_factory_serialization() -> None:
+    class AgentResponse(BaseModel):
+        result: str
+        status: str
+
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="stop",
+                content=AgentResponse(result="All good", status="ok").model_dump_json(),
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            )
+        ]
+    )
+
+    agent = AssistantAgent(
+        name="structured_agent",
+        model_client=model_client,
+        output_content_type=AgentResponse,
+        output_content_type_format="{result} - {status}",
+    )
+
+    dumped = agent.dump_component()
+    restored_agent = AssistantAgent.load_component(dumped)
+    result = await restored_agent.run()
+
+    assert isinstance(result.messages[0], StructuredMessage)
+    assert result.messages[0].content.result == "All good"  # type: ignore[reportUnknownMemberType]
+    assert result.messages[0].content.status == "ok"  # type: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.asyncio
+async def test_structured_message_format_string() -> None:
+    class AgentResponse(BaseModel):
+        field1: str
+        field2: str
+
+    expected = AgentResponse(field1="foo", field2="bar")
+
+    model_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="stop",
+                content=expected.model_dump_json(),
+                usage=RequestUsage(prompt_tokens=10, completion_tokens=5),
+                cached=False,
+            )
+        ]
+    )
+
+    agent = AssistantAgent(
+        name="formatted_agent",
+        model_client=model_client,
+        output_content_type=AgentResponse,
+        output_content_type_format="{field1} - {field2}",
+    )
+
+    result = await agent.run()
+
+    assert len(result.messages) == 1
+    message = result.messages[0]
+
+    # Check that it's a StructuredMessage with the correct content model
+    assert isinstance(message, StructuredMessage)
+    assert isinstance(message.content, AgentResponse)  # type: ignore[reportUnknownMemberType]
+    assert message.content == expected
+
+    # Check that the format_string was applied correctly
+    assert message.to_model_text() == "foo - bar"
