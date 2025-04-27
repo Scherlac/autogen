@@ -423,11 +423,13 @@ $functions"""
             self._temp_dir = None
 
         try:
+
+            # Wait for all cancellation tasks to finish before stopping the container.
+            await asyncio.gather(*self._cancellation_tasks)
+
             if self._stop_container:
                 client = docker.from_env()
                 container = await asyncio.to_thread(client.containers.get, self.container_name)
-                # Wait for all cancellation tasks to finish before stopping the container.
-                await asyncio.gather(*self._cancellation_tasks)
                 # Stop the container.
                 await asyncio.to_thread(container.stop)
         except NotFound:

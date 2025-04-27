@@ -180,60 +180,6 @@ def to_oai_type(
     return result
 
 
-def func_call_to_oai(message: FunctionCall) -> ChatCompletionMessageToolCallParam:
-    return ChatCompletionMessageToolCallParam(
-        id=message.id,
-        function={
-            "arguments": message.arguments,
-            "name": message.name,
-        },
-        type="function",
-    )
-
-
-def tool_message_to_oai(
-    message: FunctionExecutionResultMessage,
-) -> Sequence[ChatCompletionToolMessageParam]:
-    return [
-        ChatCompletionToolMessageParam(content=x.content, role="tool", tool_call_id=x.call_id) for x in message.content
-    ]
-
-
-def assistant_message_to_oai(
-    message: AssistantMessage,
-) -> ChatCompletionAssistantMessageParam:
-    assert_valid_name(message.source)
-    if isinstance(message.content, list):
-        if hasattr(message, 'thought') and message.thought is not None:
-            return ChatCompletionAssistantMessageParam(
-                content=message.thought,
-                tool_calls=[func_call_to_oai(x) for x in message.content],
-                role="assistant",
-                name=message.source,
-            )
-        else:
-            return ChatCompletionAssistantMessageParam(
-                tool_calls=[func_call_to_oai(x) for x in message.content],
-                role="assistant",
-                name=message.source,
-            )
-    else:
-        return ChatCompletionAssistantMessageParam(
-            content=message.content,
-            role="assistant",
-            name=message.source,
-        )
-
-
-def to_oai_type(message: LLMMessage, prepend_name: bool = False) -> Sequence[ChatCompletionMessageParam]:
-    if isinstance(message, SystemMessage):
-        return [system_message_to_oai(message)]
-    elif isinstance(message, UserMessage):
-        return [user_message_to_oai(message, prepend_name)]
-    elif isinstance(message, AssistantMessage):
-        return [assistant_message_to_oai(message)]
-    else:
-        return tool_message_to_oai(message)
 
 
 def calculate_vision_tokens(image: Image, detail: str = "auto") -> int:

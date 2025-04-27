@@ -917,5 +917,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
             return self._serialization_registry.serialize(
                 message, type_name=type_name, data_content_type=JSON_DATA_CONTENT_TYPE
             ).decode("utf-8")
-        except ValueError:
-            return "Message could not be serialized"
+        except ValueError as e:
+            return f"Message could not be serialized {repr(e)}" 
+        except Exception as e:
+            return f"Other error at serialization {repr(e)}"
